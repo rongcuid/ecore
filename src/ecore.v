@@ -20,7 +20,10 @@ localparam CORE_FETCH = 0,
 	CORE_DECODE = 1,
 	CORE_ALU = 2,
 	CORE_JUMP = 3,
-	CORE_RS2 = 4;
+	CORE_RS2 = 4,
+	CORE_LW = 5,
+	CORE_SW = 6,
+	CORE_WRITEBACK = 7;
 
 /* ========== RegFile ========== */
 
@@ -81,7 +84,10 @@ task decode;
 	output regwrite;
 	output branch;
 	output jump;
-	output [4:0] rd, rs1, rs2;
+	output [4:0] rd;
+        output [4:0] rs1;
+	output [4:0] rs2;
+
 	reg [6:0] opcode;
 	reg [2:0] funct3;
 	reg [6:0] funct7;
@@ -177,20 +183,81 @@ task decode;
 			OP_OP: begin
 				next_state = CORE_RS2;
 				regwrite = 1'b1;
+				case (funct3)
+					3'b000: begin
+						if (funct7 == 7'b0000000)
+							alu = ALU_ADD;
+						else if (funct7 == 7'b0100000)
+							alu = ALU_SUB;
+						else
+							illegal = 1'b1;
+					end
+					3'b001: alu = ALU_SLL;
+					3'b010: alu = ALU_SLT;
+					3'b011: alu = ALU_SLTU;
+					3'b100: alu = ALU_XOR;
+					3'b101: begin
+						if (funct7 == 7'b0000000)
+							alu = ALU_SRL;
+						else if (funct7 == 7'b0100000)
+							alu = ALU_SRA;
+						else
+							illegal = 1'b1;
+					end
+					3'b110: alu = ALU_OR;
+					3'b111: alu = ALU_AND;
+				endcase
 			end
 			OP_SYSTEM: begin
+				if (funct3 == 3'b0 
+					&& rs1 == 5'b0 && rd == 5'b0 && funct7 == 7'b0) begin
+						illegal = 1;
+				end
 			end
 			OP_AUIPC: begin
 				next_state = CORE_ALU;
 				regwrite = 1'b1;
+				op1_pc = 1'b1;
+				op2 = imm_u;
 			end
 			OP_LUI: begin
 				next_state = CORE_ALU;
 				regwrite = 1'b1;
+				rs1 = 5'b0; // Load x0
+				op2 = imm_u;
 			end
 			default: begin
 				illegal = 1'b1;
 			end
+		endcase
+	end
+endtask
+
+/* ========== ALU ========== */
+
+task alu_compute;
+	input [3:0] op;
+	input [31:0] op1;
+	input [31:0] op2;
+	output [31:0] out;
+	begin
+		case (op)
+			ALU_ADD: out = op1 + op2;
+			ALU_SUB: out = op1 - op2;
+			ALU_SLL: out = op1 << op2[4:0];
+			ALU_SLT: out = $signed(op1) < $signed(op2) ? 32'b1 : 32'b0;
+			ALU_SLTU: out = $unsigned(op1) < $unsigned(op2) ? 32'b1 : 32'b0;
+			ALU_XOR: out = op1 ^ op2;
+			ALU_SRL: out = op1 >> op2[4:0];
+			ALU_SRA: out = op1 >>> op2[4:0];
+			ALU_OR: out = op1 | op2;
+			ALU_AND: out = op1 & op2;
+			ALU_EQ: out = op1 == op2 ? 32'b1 : 32'b0;
+			ALU_NE: out = op1 != op2 ? 32'b1 : 32'b0;
+			ALU_LT: out = $signed(op1) < $signed(op2) ? 32'b1 : 32'b0;
+			ALU_GE: out = $signed(op1) >= $signed(op2) ? 32'b1 : 32'b0;
+			ALU_LTU: out = $unsigned(op1) < $unsigned(op2) ? 32'b1 : 32'b0;
+			ALU_GEU: out = $unsigned(op1) > $unsigned(op2) ? 32'b1 : 32'b0;
 		endcase
 	end
 endtask
@@ -200,15 +267,43 @@ endtask
 integer core_state;
 
 /* PC is always aligned. */
-reg [31:2] pc;
+reg [31:0] pc;
 
-reg [ROM_WORDS-1:0] rom_addr;
+reg [ROM_WORDS_LOG-1:0] rom_addr;
 assign o_rom_addr = rom_addr;
+
+wire [3:0] dec_alu_op;
+wire dec_alu_op1_pc;
+wire [31:0] dec_alu_op2;
+wire [31:0] dec_next_state;
+wire dec_illegal, dec_memory, dec_regwrite, dec_branch, dec_jump;
+wire [4:0] dec_rd, dec_rs1, dec_rs2;
+
+reg [3:0] alu_op;
+reg [31:0] alu_op1, alu_op1_tmp;
+reg [31:0] alu_op2;
+reg alu_op1_pc;
+reg memory, regwrite, branch, jump;
+reg [3:0] rd, rs1, rs2;
+
+reg [31:0] alu_out;
+wire [31:0] alu_out_tmp;
+
+reg [31:0] ram_addr;
+assign o_ram_addr = ram_addr;
 
 always @ (posedge i_clk) begin : CORE_STATE_MACHINE
 	if (i_rst) begin
 		core_state <= CORE_FETCH;
 		pc <= 32'b0;
+		alu_op <= 4'bX;
+		alu_op1 <= 32'bX;
+		alu_op2 <= 32'bX;
+		alu_op1_pc <= 1'bX;
+		memory <= 1'bX;
+		regwrite <= 1'bX;
+		branch <= 1'bX;
+		jump <= 1'bX;
 	end
 	else begin
 		case (core_state)
@@ -219,6 +314,47 @@ always @ (posedge i_clk) begin : CORE_STATE_MACHINE
 				core_state <= CORE_DECODE;
 			end
 			CORE_DECODE: begin
+				decode( i_rom_data,
+					dec_alu_op,
+					dec_alu_op1_pc,
+					dec_alu_op2,
+					dec_illegal,
+					dec_next_state,
+					dec_memory, dec_regwrite, 
+					dec_branch, dec_jump,
+					dec_rd, dec_rs1, dec_rs2
+				);
+				core_state <= dec_next_state;
+				pc <= dec_illegal ? pc + 32'h4 : 32'h4;
+				alu_op <= dec_alu_op;
+				alu_op1_pc <= dec_alu_op1_pc;
+				alu_op1 <= dec_alu_op1_pc ? pc : 32'bX;
+				alu_op2 <= dec_alu_op2;
+				memory <= dec_memory;
+				regwrite <= dec_regwrite;
+				branch <= dec_branch;
+				jump <= dec_jump;
+			end
+			CORE_ALU: begin
+				// Either alu_op1 from CORE_DECODE, or RS1
+				// from register file
+				alu_op1_tmp = alu_op1_pc ? alu_op1 : rf_rdata;
+				alu_compute(alu_op, alu_op1_tmp, alu_op2, alu_out_tmp);
+				alu_out <= alu_out_tmp;
+				ram_addr = alu_out_tmp; // Combinational
+				if (memory) begin
+					core_state <= regwrite ? CORE_LW : CORE_SW;
+				end
+			end
+			CORE_JUMP: begin
+			end
+			CORE_RS2: begin
+			end
+			CORE_LW: begin
+			end
+			CORE_SW: begin
+			end
+			CORE_WRITEBACK: begin
 			end
 		endcase
 	end
