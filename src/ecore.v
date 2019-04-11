@@ -10,6 +10,7 @@ module ecore #(
 	output wire [ROM_WORDS_LOG-1:0] o_rom_addr,
 	input wire [31:0] i_rom_data,
 
+	output wire [3:0] o_ram_we,
 	output wire [29:0] o_ram_addr,
 	output wire [31:0] o_ram_wdata,
 	input wire [31:0] i_ram_rdata
@@ -23,7 +24,8 @@ localparam CORE_FETCH = 0,
 	CORE_RS2 = 4,
 	CORE_LW = 5,
 	CORE_SW = 6,
-	CORE_WRITEBACK = 7;
+	CORE_WRITEBACK = 7,
+	CORE_PC = 8;
 
 /* ========== RegFile ========== */
 
@@ -100,7 +102,7 @@ task decode;
 		regwrite = 1'b0;
 		branch = 1'b0;
 		jump = 1'b0;
-		next_state = CORE_FETCH; // NOP
+		next_state = CORE_PC; // NOP
 		// Fields
 		opcode = inst[6:0];
 		rd = inst[11:7];
@@ -114,6 +116,7 @@ task decode;
 		imm_b = { {20{inst[31]}}, inst[7], inst[30:25], inst[11:8], 1'b0 };
 		imm_u = { inst[31:12], 12'b0 };
 		imm_j = { {12{inst[31]}}, inst[19:12], inst[20], inst[30:25], inst[24:21], 1'b0 };
+		op2 = 32'bX;
 		case (opcode)
 			OP_LOAD: begin
 				next_state = CORE_ALU;
@@ -289,10 +292,15 @@ reg [3:0] rd, rs1, rs2;
 reg [31:0] alu_out;
 wire [31:0] alu_out_tmp;
 
+reg [3:0] ram_we;
+assign o_ram_we = ram_we;
 reg [31:0] ram_addr;
 assign o_ram_addr = ram_addr;
 
-always @ (posedge i_clk) begin : CORE_STATE_MACHINE
+assign rf_we = core_state == CORE_WRITEBACK;
+assign rf_wdata = memory ? i_ram_rdata : alu_out;
+
+always @ (posedge i_clk) begin : CORE_STATE_MACHINE_SEQ
 	if (i_rst) begin
 		core_state <= CORE_FETCH;
 		pc <= 32'b0;
@@ -306,29 +314,18 @@ always @ (posedge i_clk) begin : CORE_STATE_MACHINE
 		jump <= 1'bX;
 	end
 	else begin
+		//rom_addr = {ROM_WORDS_LOG{1'bX}};
 		case (core_state)
 			CORE_FETCH: begin
-				// Combinational
-				rom_addr = pc[2+:ROM_WORDS_LOG];
+				// TODO Combinational
+				//rom_addr = pc[2+:ROM_WORDS_LOG];
 				// Sequential
 				core_state <= CORE_DECODE;
 			end
 			CORE_DECODE: begin
-				decode( i_rom_data,
-					dec_alu_op,
-					dec_alu_op1_pc,
-					dec_alu_op2,
-					dec_illegal,
-					dec_next_state,
-					dec_memory, dec_regwrite, 
-					dec_branch, dec_jump,
-					dec_rd, dec_rs1, dec_rs2
-				);
 				core_state <= dec_next_state;
-				pc <= dec_illegal ? pc + 32'h4 : 32'h4;
 				alu_op <= dec_alu_op;
 				alu_op1_pc <= dec_alu_op1_pc;
-				alu_op1 <= dec_alu_op1_pc ? pc : 32'bX;
 				alu_op2 <= dec_alu_op2;
 				memory <= dec_memory;
 				regwrite <= dec_regwrite;
@@ -336,28 +333,81 @@ always @ (posedge i_clk) begin : CORE_STATE_MACHINE
 				jump <= dec_jump;
 			end
 			CORE_ALU: begin
-				// Either alu_op1 from CORE_DECODE, or RS1
-				// from register file
-				alu_op1_tmp = alu_op1_pc ? alu_op1 : rf_rdata;
-				alu_compute(alu_op, alu_op1_tmp, alu_op2, alu_out_tmp);
 				alu_out <= alu_out_tmp;
-				ram_addr = alu_out_tmp; // Combinational
 				if (memory) begin
 					core_state <= regwrite ? CORE_LW : CORE_SW;
 				end
+				else if (regwrite) begin
+					core_state <= CORE_WRITEBACK;
+				end
 			end
 			CORE_JUMP: begin
+				pc <= alu_out;
+				alu_out <= pc + 32'h4;
+				core_state <= CORE_WRITEBACK;
 			end
 			CORE_RS2: begin
+				// Read RS2 to OP2
+				alu_op2 <= rf_rdata;
+				// TODO RS1
+				core_state <= CORE_ALU;
 			end
 			CORE_LW: begin
+				alu_out <= i_ram_rdata;
+				core_state <= CORE_WRITEBACK;
 			end
 			CORE_SW: begin
+				// TODO All work is combinational
+				core_state <= CORE_PC;
 			end
 			CORE_WRITEBACK: begin
+				// All work is combinational
+				if (jump || branch) begin
+					core_state <= CORE_DECODE;
+				end
+				else begin
+					core_state <= CORE_PC;
+				end
+			end
+			CORE_PC: begin
+				pc <= pc + 32'h4;
 			end
 		endcase
 	end
+end
+
+always @ (*) begin : CORE_FSM_COMBINATIONAL
+	rom_addr = {ROM_WORDS_LOG{1'bX}};
+	rf_addr = 4'bX;
+	alu_op1_tmp = 32'bX;
+	ram_we = 4'b0;
+	case (core_state)
+		CORE_FETCH: begin
+			rom_addr = pc[2+:ROM_WORDS_LOG];
+		end
+		CORE_DECODE: begin
+			decode( i_rom_data,
+				dec_alu_op,
+				dec_alu_op1_pc,
+				dec_alu_op2,
+				dec_illegal,
+				dec_next_state,
+				dec_memory, dec_regwrite, 
+				dec_branch, dec_jump,
+				dec_rd, dec_rs1, dec_rs2
+			);
+			rf_addr = dec_next_state == CORE_RS2 ? dec_rs2[3:0] : dec_rs1[3:0];
+		end
+		CORE_ALU: begin
+			// Either alu_op1 from CORE_DECODE, or RS1 from register file
+			alu_op1_tmp = alu_op1_pc ? pc : rf_rdata;
+			alu_compute(alu_op, alu_op1_tmp, alu_op2, alu_out_tmp);
+			// Memory map: 
+			// 0x00000000 -> ROM
+			// 0x80000000 -> RAM
+			ram_addr = { 1'b0, alu_out_tmp[30:0] }; 
+		end
+	endcase
 end
 
 endmodule
