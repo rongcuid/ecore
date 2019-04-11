@@ -19,7 +19,8 @@ module ecore #(
 localparam CORE_FETCH = 0,
 	CORE_DECODE = 1,
 	CORE_ALU = 2,
-	CORE_JUMP = 3;
+	CORE_JUMP = 3,
+	CORE_RS2 = 4;
 
 /* ========== RegFile ========== */
 
@@ -52,23 +53,27 @@ localparam OP_LOAD = 7'b0000011,
 	OP_AUIPC = 7'b0010111,
 	OP_LUI = 7'b0110111;
 
-localparam ALU_NONE = 4'd0,
-	ALU_ADD = 4'd1,
-	ALU_SUB = 4'd2,
-	ALU_SLL = 4'd3,
-	ALU_SLT = 4'd4,
-	ALU_SLTU = 4'd5,
-	ALU_XOR = 4'd6,
-	ALU_SRL = 4'd7,
-	ALU_SRA = 4'd8,
-	ALU_OR = 4'd9,
-	ALU_AND = 4'd10;
+localparam ALU_ADD = 4'd0,
+	ALU_SUB = 4'd1,
+	ALU_SLL = 4'd2,
+	ALU_SLT = 4'd3,
+	ALU_SLTU = 4'd4,
+	ALU_XOR = 4'd5,
+	ALU_SRL = 4'd6,
+	ALU_SRA = 4'd7,
+	ALU_OR = 4'd8,
+	ALU_AND = 4'd9,
+	ALU_EQ = 4'd10,
+	ALU_NE = 4'd11,
+	ALU_LT = 4'd12,
+	ALU_GE = 4'd13,
+	ALU_LTU = 4'd14,
+	ALU_GEU = 4'd15;
 
 task decode;
-	input [31:0] pc;
 	input [31:0] inst;
 	output [3:0] alu;
-	output [31:0] op1;
+	output op1_pc;
 	output [31:0] op2;
 	output illegal;
 	output [31:0] next_state;
@@ -76,14 +81,14 @@ task decode;
 	output regwrite;
 	output branch;
 	output jump;
-	output [3:0] rd, rs2;
+	output [4:0] rd, rs1, rs2;
 	reg [6:0] opcode;
-	reg [3:0] rs1;
 	reg [2:0] funct3;
-	reg [7:0] funct7;
+	reg [6:0] funct7;
 	reg [31:0] imm_i, imm_s, imm_b, imm_u, imm_j;
 	begin
 		// Defaults
+		op1_pc = 1'b0;
 		illegal = 1'b0;
 		memory = 1'b0;
 		regwrite = 1'b0;
@@ -98,8 +103,8 @@ task decode;
 		rs2 = inst[24:20];
 		funct7 = inst[31:25];
 		// Immediates
-		imm_i = { {21{inst[31]}}, inst[31:20] };
-		imm_s = { {21{inst[31]}}, funct7, rd };
+		imm_i = { {20{inst[31]}}, inst[31:20] };
+		imm_s = { {20{inst[31]}}, funct7, rd };
 		imm_b = { {20{inst[31]}}, inst[7], inst[30:25], inst[11:8], 1'b0 };
 		imm_u = { inst[31:12], 12'b0 };
 		imm_j = { {12{inst[31]}}, inst[19:12], inst[20], inst[30:25], inst[24:21], 1'b0 };
@@ -108,30 +113,69 @@ task decode;
 				next_state = CORE_ALU;
 				memory = 1'b1;
 				regwrite = 1'b1;
+				op2 = imm_i;
+				alu = ALU_ADD;
 			end
 			OP_STORE: begin
-				next_state = CORE_ALU;
+				next_state = CORE_RS2;
 				memory = 1'b1;
+				op2 = imm_s;
+				alu = ALU_ADD;
 			end
 			OP_BRANCH: begin
-				next_state = CORE_ALU;
-				branch = 1'b1;		
+				next_state = CORE_RS2;
+				branch = 1'b1;
+				case (funct3)
+					3'b000: alu = ALU_EQ;
+					3'b001: alu = ALU_NE;
+					3'b100: alu = ALU_LT;
+					3'b101: alu = ALU_GE;
+					3'b110: alu = ALU_LTU;
+					3'b111: alu = ALU_GEU;
+					default: illegal = 1'b1;
+				endcase
 			end
 			OP_JALR: begin
 				next_state = CORE_ALU;
+				regwrite = 1'b1;
 				jump = 1'b1;
+				op2 = imm_i;
+				alu = ALU_ADD;
 			end
 			OP_MISCMEM: begin
 			end
 			OP_JAL: begin
-				next_state = CORE_JUMP;
+				next_state = CORE_ALU;
+				regwrite = 1'b1;
+				jump = 1'b1;
+				op1_pc = 1'b1; // Add with PC
+				op2 = imm_j + 32'h4;
+				alu = ALU_ADD;
 			end
 			OP_OPIMM: begin
 				next_state = CORE_ALU;
 				regwrite = 1'b1;
+				op2 = imm_i;
+				case (funct3)
+					3'b000: alu = ALU_ADD;
+					3'b010: alu = ALU_SLT;
+					3'b011: alu = ALU_SLTU;
+					3'b100: alu = ALU_XOR;
+					3'b110: alu = ALU_OR;
+					3'b111: alu = ALU_AND;
+					3'b001: alu = ALU_SLL;
+					3'b101: begin
+						if (funct7 == 7'b0000000)
+							alu = ALU_SRL;
+						else if (funct7 == 7'b0100000)
+							alu = ALU_SRA;
+						else
+							illegal = 1'b1;
+					end
+				endcase
 			end
 			OP_OP: begin
-				next_state = CORE_ALU;
+				next_state = CORE_RS2;
 				regwrite = 1'b1;
 			end
 			OP_SYSTEM: begin
